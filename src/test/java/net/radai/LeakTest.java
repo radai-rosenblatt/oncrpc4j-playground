@@ -77,7 +77,7 @@ public class LeakTest {
         }
     }
 
-    @Test
+//    @Test
     public void testLeakWithPortmapClient() throws Throwable {
         ExecutorService executor = Executors.newFixedThreadPool(N_THREADS);
         Set<Future<Void>> futures = new HashSet<>();
