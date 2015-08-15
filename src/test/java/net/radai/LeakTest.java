@@ -1,6 +1,7 @@
 package net.radai;
 
 import com.codahale.metrics.ConsoleReporter;
+import com.codahale.metrics.Counter;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
 import org.dcache.utils.net.InetSocketAddresses;
@@ -8,6 +9,8 @@ import org.dcache.xdr.IpProtocolType;
 import org.dcache.xdr.OncRpcClient;
 import org.dcache.xdr.XdrTransport;
 import org.dcache.xdr.portmap.GenericPortmapClient;
+import org.glassfish.grizzly.Connection;
+import org.glassfish.grizzly.GrizzlyFuture;
 import org.glassfish.grizzly.nio.transport.TCPNIOTransport;
 import org.glassfish.grizzly.nio.transport.TCPNIOTransportBuilder;
 import org.junit.After;
@@ -41,6 +44,8 @@ public class LeakTest {
     private MetricRegistry metrics = new MetricRegistry();
     private Meter requests = metrics.meter("requests");
     private Meter bindFailures = metrics.meter("bindFailures");
+    private Counter opens = metrics.counter("opens");
+    private Counter closes = metrics.counter("closes");
     private ConsoleReporter reporter;
 
     @Before
@@ -92,7 +97,7 @@ public class LeakTest {
         Set<Future<Void>> futures = new HashSet<>();
         InetSocketAddress inetSocketAddress = new InetSocketAddress(localhostAddress, 111);
         for (int i = 0; i < N_THREADS; i++) {
-            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures));
+            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures, opens, closes));
             futures.add(future);
         }
         for (Future<Void> future : futures) {
@@ -105,21 +110,27 @@ public class LeakTest {
         private final InetSocketAddress address;
         private final Meter requests;
         private final Meter bindFailures;
+        private final Counter opens;
+        private final Counter closes;
 
-        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures) {
+        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures, Counter opens, Counter closes) {
             this.address = address;
             this.requests = requests;
             this.bindFailures = bindFailures;
+            this.opens = opens;
+            this.closes = closes;
         }
 
         @Override
         public Void call() throws Exception {
             while (!die) {
+                TCPNIOTransport transport = null;
                 try {
-                    TCPNIOTransport transport = TCPNIOTransportBuilder.newInstance().build();
+                    transport = TCPNIOTransportBuilder.newInstance().build();
                     transport.start();
-                    transport.connect(address).get(); //block
-                    transport.shutdown().get(); //block
+                    GrizzlyFuture<Connection> connectFuture = transport.connect(address);
+                    connectFuture.get(); //block
+                    opens.inc(); //successful open
                     requests.mark();
                 } catch (Throwable t) {
                     //noinspection ThrowableResultOfMethodCallIgnored
@@ -130,6 +141,11 @@ public class LeakTest {
                     }
                     causeOfDeath = t;
                     die = true;
+                } finally {
+                    if (transport != null) {
+                        transport.shutdown().get(); //block
+                        closes.inc(); //successful close
+                    }
                 }
             }
             return null;
