@@ -9,8 +9,6 @@ import org.dcache.xdr.IpProtocolType;
 import org.dcache.xdr.OncRpcClient;
 import org.dcache.xdr.XdrTransport;
 import org.dcache.xdr.portmap.GenericPortmapClient;
-import org.glassfish.grizzly.Connection;
-import org.glassfish.grizzly.GrizzlyFuture;
 import org.glassfish.grizzly.nio.transport.TCPNIOTransport;
 import org.glassfish.grizzly.nio.transport.TCPNIOTransportBuilder;
 import org.junit.After;
@@ -44,8 +42,10 @@ public class LeakTest {
     private MetricRegistry metrics = new MetricRegistry();
     private Meter requests = metrics.meter("requests");
     private Meter bindFailures = metrics.meter("bindFailures");
-    private Counter opens = metrics.counter("opens");
-    private Counter closes = metrics.counter("closes");
+    private Counter successfulOpens = metrics.counter("successfulOpens");
+    private Counter failedOpens = metrics.counter("failedOpens");
+    private Counter successfulCloses = metrics.counter("successfulCloses");
+    private Counter failedCloses = metrics.counter("failedCloses");
     private ConsoleReporter reporter;
 
     @Before
@@ -67,7 +67,7 @@ public class LeakTest {
                 .convertRatesTo(TimeUnit.SECONDS)
                 .convertDurationsTo(TimeUnit.MILLISECONDS)
                 .build();
-        reporter.start(1, TimeUnit.SECONDS);
+        reporter.start(10, TimeUnit.SECONDS);
     }
 
     @After
@@ -97,12 +97,14 @@ public class LeakTest {
         Set<Future<Void>> futures = new HashSet<>();
         InetSocketAddress inetSocketAddress = new InetSocketAddress(localhostAddress, 111);
         for (int i = 0; i < N_THREADS; i++) {
-            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures, opens, closes));
+            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures, successfulOpens, failedOpens, successfulCloses, failedCloses));
             futures.add(future);
         }
         for (Future<Void> future : futures) {
             future.get(); //block
         }
+        Thread.sleep(1000); //let everything calm down
+        reporter.report();
         throw causeOfDeath;
     }
 
@@ -110,27 +112,32 @@ public class LeakTest {
         private final InetSocketAddress address;
         private final Meter requests;
         private final Meter bindFailures;
-        private final Counter opens;
-        private final Counter closes;
+        private final Counter successfulOpens;
+        private final Counter failedOpens;
+        private final Counter successfulCloses;
+        private final Counter failedCloses;
 
-        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures, Counter opens, Counter closes) {
+        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures, Counter successfulOpens, Counter failedOpens, Counter successfulCloses, Counter failedCloses) {
             this.address = address;
             this.requests = requests;
             this.bindFailures = bindFailures;
-            this.opens = opens;
-            this.closes = closes;
+            this.successfulOpens = successfulOpens;
+            this.failedOpens = failedOpens;
+            this.successfulCloses = successfulCloses;
+            this.failedCloses = failedCloses;
         }
 
         @Override
         public Void call() throws Exception {
             while (!die) {
                 TCPNIOTransport transport = null;
+                boolean opened = false;
                 try {
                     transport = TCPNIOTransportBuilder.newInstance().build();
                     transport.start();
-                    GrizzlyFuture<Connection> connectFuture = transport.connect(address);
-                    connectFuture.get(); //block
-                    opens.inc(); //successful open
+                    transport.connect(address).get(); //block
+                    opened = true;
+                    successfulOpens.inc(); //successful open
                     requests.mark();
                 } catch (Throwable t) {
                     //noinspection ThrowableResultOfMethodCallIgnored
@@ -142,9 +149,21 @@ public class LeakTest {
                     causeOfDeath = t;
                     die = true;
                 } finally {
+                    if (!opened) {
+                        failedOpens.inc();
+                    }
                     if (transport != null) {
-                        transport.shutdown().get(); //block
-                        closes.inc(); //successful close
+                        try {
+                            transport.shutdown().get(); //block
+                            successfulCloses.inc(); //successful close
+                        } catch (Throwable t) {
+                            failedCloses.inc();
+                            System.err.println("while trying to close transport");
+                            t.printStackTrace();
+                        }
+                    } else {
+                        //no transport == successful close
+                        successfulCloses.inc();
                     }
                 }
             }
