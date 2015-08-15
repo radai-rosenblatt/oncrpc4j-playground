@@ -8,6 +8,8 @@ import org.dcache.xdr.IpProtocolType;
 import org.dcache.xdr.OncRpcClient;
 import org.dcache.xdr.XdrTransport;
 import org.dcache.xdr.portmap.GenericPortmapClient;
+import org.glassfish.grizzly.nio.transport.TCPNIOTransport;
+import org.glassfish.grizzly.nio.transport.TCPNIOTransportBuilder;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -16,6 +18,7 @@ import org.junit.Test;
 import java.net.BindException;
 import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -30,6 +33,7 @@ import java.util.concurrent.TimeUnit;
  * @since Phase1
  */
 public class LeakTest {
+    public static final int N_THREADS = 10;
     private static volatile boolean die = false;
     private static volatile Throwable causeOfDeath = null;
 
@@ -58,7 +62,7 @@ public class LeakTest {
                 .convertRatesTo(TimeUnit.SECONDS)
                 .convertDurationsTo(TimeUnit.MILLISECONDS)
                 .build();
-        reporter.start(30, TimeUnit.SECONDS);
+        reporter.start(1, TimeUnit.SECONDS);
     }
 
     @After
@@ -69,18 +73,67 @@ public class LeakTest {
     }
 
     @Test
-    public void testLeak() throws Exception {
-        int nThreads = 10;
-        ExecutorService executor = Executors.newFixedThreadPool(nThreads);
+    public void testLeakWithPortmapClient() throws Throwable {
+        ExecutorService executor = Executors.newFixedThreadPool(N_THREADS);
         Set<Future<Void>> futures = new HashSet<>();
-        for (int i = 0; i < nThreads; i++) {
+        for (int i = 0; i < N_THREADS; i++) {
             Future<Void> future = executor.submit(new PortmapQueryTask(localhostAddress, requests, bindFailures));
             futures.add(future);
         }
         for (Future<Void> future : futures) {
             future.get(); //block
         }
-        throw new AssertionError("terminated", causeOfDeath);
+        throw causeOfDeath;
+    }
+
+    @Test
+    public void testLeakWithGrizzly() throws Throwable {
+        ExecutorService executor = Executors.newFixedThreadPool(N_THREADS);
+        Set<Future<Void>> futures = new HashSet<>();
+        InetSocketAddress inetSocketAddress = new InetSocketAddress(localhostAddress, 111);
+        for (int i = 0; i < N_THREADS; i++) {
+            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures));
+            futures.add(future);
+        }
+        for (Future<Void> future : futures) {
+            future.get(); //block
+        }
+        throw causeOfDeath;
+    }
+
+    private static class GrizzlyConnectTask implements Callable<Void> {
+        private final InetSocketAddress address;
+        private final Meter requests;
+        private final Meter bindFailures;
+
+        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures) {
+            this.address = address;
+            this.requests = requests;
+            this.bindFailures = bindFailures;
+        }
+
+        @Override
+        public Void call() throws Exception {
+            while (!die) {
+                try {
+                    TCPNIOTransport transport = TCPNIOTransportBuilder.newInstance().build();
+                    transport.start();
+                    transport.connect(address).get(); //block
+                    transport.shutdown().get(); //block
+                    requests.mark();
+                } catch (Throwable t) {
+                    //noinspection ThrowableResultOfMethodCallIgnored
+                    Throwable root = getRootCause(t);
+                    if (root instanceof BindException) {
+                        bindFailures.mark(); //ephemeral port exhaustion.
+                        continue;
+                    }
+                    causeOfDeath = t;
+                    die = true;
+                }
+            }
+            return null;
+        }
     }
 
     private static class PortmapQueryTask implements Callable<Void> {
@@ -96,7 +149,6 @@ public class LeakTest {
 
         @Override
         public Void call() throws Exception {
-            //noinspection InfiniteLoopStatement
             while (!die) {
                 try (OncRpcClient rpcClient = new OncRpcClient(address, IpProtocolType.TCP, 111)) {
                     XdrTransport transport = rpcClient.connect();
@@ -108,7 +160,7 @@ public class LeakTest {
                     //noinspection ThrowableResultOfMethodCallIgnored
                     Throwable root = getRootCause(t);
                     if (root instanceof BindException) {
-                        bindFailures.mark();
+                        bindFailures.mark(); //ephemeral port exhaustion.
                         continue;
                     }
                     causeOfDeath = t;
