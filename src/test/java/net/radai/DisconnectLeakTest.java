@@ -11,6 +11,7 @@ import org.dcache.xdr.XdrTransport;
 import org.dcache.xdr.portmap.GenericPortmapClient;
 import org.glassfish.grizzly.nio.transport.TCPNIOTransport;
 import org.glassfish.grizzly.nio.transport.TCPNIOTransportBuilder;
+import org.glassfish.grizzly.strategies.SameThreadIOStrategy;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -20,6 +21,9 @@ import java.net.BindException;
 import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -33,7 +37,7 @@ import java.util.concurrent.TimeUnit;
  * @version Aug 15, 2015
  * @since Phase1
  */
-public class LeakTest {
+public class DisconnectLeakTest {
     public static final int N_THREADS = 10;
     private static volatile boolean die = false;
     private static volatile Throwable causeOfDeath = null;
@@ -55,9 +59,9 @@ public class LeakTest {
             XdrTransport transport = rpcClient.connect();
             GenericPortmapClient portmapClient = new GenericPortmapClient(transport);
             String uaddr = InetSocketAddresses.uaddrOf("127.0.0.1", 666);
-            portmapClient.setPort(666, 666, "tcp", uaddr, "bob");
+            portmapClient.setPort(666, 666, "tcp", uaddr, "bob"); //register a bogus "bob" application on port 666
         } catch (Throwable t) {
-            Throwable cause = getRootCause(t);
+            Throwable cause = Util.getRootCause(t);
             if (cause instanceof ConnectException) {
                 Assume.assumeNoException("rpcbind should be running", cause);
             }
@@ -97,7 +101,7 @@ public class LeakTest {
         Set<Future<Void>> futures = new HashSet<>();
         InetSocketAddress inetSocketAddress = new InetSocketAddress(localhostAddress, 111);
         for (int i = 0; i < N_THREADS; i++) {
-            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures, successfulOpens, failedOpens, successfulCloses, failedCloses));
+            Future<Void> future = executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures, successfulOpens, failedOpens, successfulCloses, failedCloses, 0));
             futures.add(future);
         }
         for (Future<Void> future : futures) {
@@ -108,6 +112,52 @@ public class LeakTest {
         throw causeOfDeath;
     }
 
+//    @Test
+    public void testSlowLeakWithGrizzly() throws Throwable {
+        ExecutorService executor = Executors.newFixedThreadPool(1);
+        Set<Future<Void>> futures = new HashSet<>();
+        InetSocketAddress inetSocketAddress = new InetSocketAddress(localhostAddress, 111);
+        //on my machine 1 thread wit a 2 milli sleep interval results in no bind exceptions
+        executor.submit(new GrizzlyConnectTask(inetSocketAddress, requests, bindFailures, successfulOpens, failedOpens, successfulCloses, failedCloses, 2)).get();
+        Thread.sleep(1000); //let everything calm down
+        reporter.report();
+        throw causeOfDeath;
+    }
+
+    @Test
+    public void testLeakWithNio() throws Throwable {
+//        SelectorProvider provider = SelectorProvider.provider();
+        InetSocketAddress inetSocketAddress = new InetSocketAddress(localhostAddress, 111);
+        while (true) {
+            Selector selector = Selector.open();
+            SocketChannel socketChannel = SocketChannel.open();
+            socketChannel.configureBlocking(false);
+            SelectionKey key = socketChannel.register(selector, SelectionKey.OP_CONNECT | SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+            try {
+                socketChannel.connect(inetSocketAddress);
+                int numReadyChannels = selector.select();
+                Set<SelectionKey> readyKeys = selector.selectedKeys();
+                for (SelectionKey k : readyKeys) {
+                    if (k.isConnectable()) {
+                        successfulOpens.inc();
+                        requests.mark();
+                        //connection established
+                    }
+                }
+//            AbstractSelector selector = provider.openSelector();
+                selector.close();
+                socketChannel.close();
+                successfulCloses.inc();
+            } catch (BindException e) {
+                failedOpens.inc();
+                bindFailures.mark();
+                selector.close();
+                socketChannel.close();
+                successfulCloses.inc();
+            }
+        }
+    }
+
     private static class GrizzlyConnectTask implements Callable<Void> {
         private final InetSocketAddress address;
         private final Meter requests;
@@ -116,8 +166,9 @@ public class LeakTest {
         private final Counter failedOpens;
         private final Counter successfulCloses;
         private final Counter failedCloses;
+        private final long sleepMillis;
 
-        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures, Counter successfulOpens, Counter failedOpens, Counter successfulCloses, Counter failedCloses) {
+        public GrizzlyConnectTask(InetSocketAddress address, Meter requests, Meter bindFailures, Counter successfulOpens, Counter failedOpens, Counter successfulCloses, Counter failedCloses, long sleepMillis) {
             this.address = address;
             this.requests = requests;
             this.bindFailures = bindFailures;
@@ -125,15 +176,19 @@ public class LeakTest {
             this.failedOpens = failedOpens;
             this.successfulCloses = successfulCloses;
             this.failedCloses = failedCloses;
+            this.sleepMillis = sleepMillis;
         }
 
         @Override
         public Void call() throws Exception {
             while (!die) {
+                if (sleepMillis > 0) {
+                    Thread.sleep(sleepMillis);
+                }
                 TCPNIOTransport transport = null;
                 boolean opened = false;
                 try {
-                    transport = TCPNIOTransportBuilder.newInstance().build();
+                    transport = TCPNIOTransportBuilder.newInstance().setIOStrategy(SameThreadIOStrategy.getInstance()).build();
                     transport.start();
                     transport.connect(address).get(); //block
                     opened = true;
@@ -141,7 +196,7 @@ public class LeakTest {
                     requests.mark();
                 } catch (Throwable t) {
                     //noinspection ThrowableResultOfMethodCallIgnored
-                    Throwable root = getRootCause(t);
+                    Throwable root = Util.getRootCause(t);
                     if (root instanceof BindException) {
                         bindFailures.mark(); //ephemeral port exhaustion.
                         continue;
@@ -193,7 +248,7 @@ public class LeakTest {
                     requests.mark();
                 } catch (Throwable t) {
                     //noinspection ThrowableResultOfMethodCallIgnored
-                    Throwable root = getRootCause(t);
+                    Throwable root = Util.getRootCause(t);
                     if (root instanceof BindException) {
                         bindFailures.mark(); //ephemeral port exhaustion.
                         continue;
@@ -204,13 +259,5 @@ public class LeakTest {
             }
             return null;
         }
-    }
-
-    private static Throwable getRootCause(Throwable t) {
-        Throwable cause = t;
-        while (cause.getCause() != null && cause.getCause() != cause) {
-            cause = cause.getCause();
-        }
-        return cause;
     }
 }
